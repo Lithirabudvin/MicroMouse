@@ -33,15 +33,17 @@ volatile long rightEncoderCount = 0;
 
 // Wall-Following Parameters
 const int desiredDistance = 100;  // mm
-const int baseSpeed = 40;         // Keep for tuning
+const int baseSpeed = 40;         
 const int maxSpeed = 100;         
 const int minSpeed = 40;          
-const int frontStopDistance = 150;
+const int frontStopDistance = 250;  // Increased from 150
+const int frontSlowDistance = 350;
 
-// PID Parameters - Refined for stability
-const float Kp = 0.2;  // Further reduced for gentler response
-const float Ki = 0.05; // Small integral to correct steady-state error
-const float Kd = 2.5;  // Increased for stronger damping
+// PID Parameters
+const float Kp = 0.15;
+const float Ki = 0.01;
+const float Kd = 2.0;
+const int DEADBAND = 5;
 
 // PID Variables
 float previousError = 0.0;
@@ -49,7 +51,7 @@ float integral = 0.0;
 unsigned long lastTime = 0;
 
 // Motor Balancing Parameters
-const float INITIAL_BALANCE = 0.9f; // Adjusted lower to compensate right motor
+const float INITIAL_BALANCE = 0.9f;
 const int BALANCE_SAMPLES = 5;
 const int BALANCE_INTERVAL = 200;
 const int MIN_DELTA_FOR_BALANCE = 10;
@@ -68,28 +70,53 @@ float gyroX, gyroY, gyroZ;
 float heading = 0.0;
 float targetHeading = 0.0;
 bool isTurning = false;
+unsigned long turnStartTime = 0;
+const unsigned long MAX_TURN_TIME = 3000;
 
 // Sensor Smoothing
-const int FILTER_SIZE = 5; // Increased for more smoothing
+const int FILTER_SIZE = 7;
 int leftDistHistory[FILTER_SIZE];
 int rightDistHistory[FILTER_SIZE];
 int frontDistHistory[FILTER_SIZE];
 int filterIndex = 0;
 
 // Wall Selection Hysteresis
-const int HYSTERESIS_THRESHOLD = 20; // mm difference to switch walls
+const int HYSTERESIS_THRESHOLD = 20;
 bool followingLeft = false;
 
-// ...existing code...
+// Robot States
+enum RobotState { FOLLOWING, TURNING, TURNING_90, REVERSING, STOPPED, RECOVERING };
+RobotState currentState = FOLLOWING;
+
+// Motor smoothing
+int currentLeftSpeed = 0;
+int currentRightSpeed = 0;
+const int MAX_SPEED_CHANGE = 3;
+
+// Turn completion detection
+const float TURN_COMPLETE_THRESHOLD = 15.0;
+const int WALL_DETECTION_THRESHOLD = 500;
+
+// Heading correction
+const float HEADING_CORRECTION_DEADBAND = 3.0;
+unsigned long lastHeadingUpdate = 0;
+
+// Corner detection
+const int CORNER_DETECTION_THRESHOLD = 300; // mm for side wall detection in corners
+const int REVERSE_DISTANCE = 200; // mm to reverse before turning
 
 // Function prototypes
 void readMPU6050();
 void updateHeading();
 void applyHeadingCorrection(int &leftSpeed, int &rightSpeed);
 void balanceMotors(int leftDist, int rightDist, int frontDist);
-
-// ...existing code...
-
+void setMotorsSmoothly(int targetLeft, int targetRight);
+int getMedianDistance(VL53L0X &sensor, int *history);
+bool isTurnComplete();
+void handleCorner(int &leftSpeed, int &rightSpeed, int leftDist, int rightDist, int frontDist);
+void handleFollowingState(int &leftSpeed, int &rightSpeed, int leftDist, int rightDist, int frontDist, float dt);
+void handleTurningState(int &leftSpeed, int &rightSpeed);
+void handleReversingState(int &leftSpeed, int &rightSpeed);
 
 void setup() {
   Serial.begin(115200);
@@ -180,30 +207,39 @@ void setup() {
   }, CHANGE);
 
   lastTime = millis();
-  Serial.println("System Ready with MPU6050!");
+  targetHeading = 0.0;
+  Serial.println("System Ready with Improved Corner Handling!");
 }
 
-int getFilteredDistance(VL53L0X &sensor, int *history) {
+int getMedianDistance(VL53L0X &sensor, int *history) {
   int raw = sensor.readRangeContinuousMillimeters();
   if (sensor.timeoutOccurred() || raw > 1000) raw = 1000;
-  history[filterIndex % FILTER_SIZE] = raw;
-  int sum = 0;
-  int validCount = 0;
-  for (int i = 0; i < FILTER_SIZE; i++) {
-    if (history[i] < 1000) {
-      sum += history[i];
-      validCount++;
+  
+  for (int i = FILTER_SIZE-1; i > 0; i--) {
+    history[i] = history[i-1];
+  }
+  history[0] = raw;
+  
+  int temp[FILTER_SIZE];
+  memcpy(temp, history, sizeof(temp));
+  
+  for (int i = 0; i < FILTER_SIZE-1; i++) {
+    for (int j = i+1; j < FILTER_SIZE; j++) {
+      if (temp[j] < temp[i]) {
+        int swap = temp[i];
+        temp[i] = temp[j];
+        temp[j] = swap;
+      }
     }
   }
-  return validCount > 0 ? sum / validCount : 1000;
+  
+  return temp[FILTER_SIZE/2];
 }
 
 void loop() {
-  // Read and filter sensor data
-  int leftDist = getFilteredDistance(sensorLeft, leftDistHistory);
-  int rightDist = getFilteredDistance(sensorRight, rightDistHistory);
-  int frontDist = getFilteredDistance(sensorFront, frontDistHistory);
-  filterIndex++;
+  int leftDist = getMedianDistance(sensorLeft, leftDistHistory);
+  int rightDist = getMedianDistance(sensorRight, rightDistHistory);
+  int frontDist = getMedianDistance(sensorFront, frontDistHistory);
 
   readMPU6050();
   updateHeading();
@@ -212,104 +248,275 @@ void loop() {
   float dt = (currentTime - lastTime) / 1000.0;
   lastTime = currentTime;
 
-  int leftSpeed = baseSpeed;
-  int rightSpeed = baseSpeed;
+  int targetLeftSpeed = baseSpeed;
+  int targetRightSpeed = baseSpeed;
 
-  float error = 0.0;
-
-  if (frontDist < frontStopDistance) {
-    isTurning = true;
-    if (leftDist > rightDist) {
-      leftSpeed = baseSpeed;
-      rightSpeed = -baseSpeed;
-      targetHeading = heading + 90.0;
-    } else {
-      leftSpeed = -baseSpeed;
-      rightSpeed = baseSpeed;
-      targetHeading = heading - 90.0;
-    }
-    integral = 0.0;
-    previousError = 0.0;
-  } else {
-    // Check if turn is complete
-    float headingError = abs(targetHeading - heading);
-    if (isTurning && headingError < 5.0) { // Within 5° of target
-      isTurning = false;
-      targetHeading = heading; // Reset to current heading
-    }
-
-    if (!isTurning) {
-      bool leftDetected = leftDist < desiredDistance * 2;
-      bool rightDetected = rightDist < desiredDistance * 2;
+  // State machine
+  switch (currentState) {
+    case FOLLOWING:
+      handleFollowingState(targetLeftSpeed, targetRightSpeed, leftDist, rightDist, frontDist, dt);
+      break;
+    case TURNING:
+      handleTurningState(targetLeftSpeed, targetRightSpeed);
+      break;
+    case TURNING_90:
+      handleTurningState(targetLeftSpeed, targetRightSpeed);
+      break;
+    case REVERSING:
+      handleReversingState(targetLeftSpeed, targetRightSpeed);
+      break;
+    case RECOVERING:
+      // Gentle forward movement while looking for walls
+      targetHeading = heading;
+      applyHeadingCorrection(targetLeftSpeed, targetRightSpeed);
       
-      // Hysteresis for wall selection
-      if (leftDetected && rightDetected) {
-        if (followingLeft && rightDist < leftDist - HYSTERESIS_THRESHOLD) {
-          followingLeft = false;
-        } else if (!followingLeft && leftDist < rightDist - HYSTERESIS_THRESHOLD) {
-          followingLeft = true;
-        }
-      } else if (leftDetected) {
-        followingLeft = true;
-      } else if (rightDetected) {
-        followingLeft = false;
-      } else {
-        followingLeft = false; // Default to right if no walls
+      if (leftDist < desiredDistance * 2 || rightDist < desiredDistance * 2) {
+        currentState = FOLLOWING;
       }
-
-      if (leftDetected || rightDetected) {
-        error = (followingLeft ? leftDist : rightDist) - desiredDistance;
-        if (abs(error) < 5) error = 0.0;
-        
-        integral += error * dt;
-        integral = constrain(integral, -50.0, 50.0);
-        float derivative = (error - previousError) / dt;
-        float correction = Kp * error + Ki * integral + Kd * derivative;
-        correction = constrain(correction, -15.0, 15.0); // Tighter limit
-        previousError = error;
-
-        if (followingLeft) {
-          rightSpeed += (int)correction;
-        } else {
-          leftSpeed += (int)correction;
-        }
-      } else {
-        integral = 0.0;
-        previousError = 0.0;
-        targetHeading = heading;
-      }
-
-      // Apply heading correction only when not turning
-      applyHeadingCorrection(leftSpeed, rightSpeed);
-    }
+      break;
+    case STOPPED:
+      targetLeftSpeed = 0;
+      targetRightSpeed = 0;
+      break;
   }
 
-  leftSpeed = constrain(leftSpeed, -maxSpeed, maxSpeed);
-  rightSpeed = constrain(rightSpeed, -maxSpeed, maxSpeed);
+  targetLeftSpeed = constrain(targetLeftSpeed, -maxSpeed, maxSpeed);
+  targetRightSpeed = constrain(targetRightSpeed, -maxSpeed, maxSpeed);
 
   if (millis() - lastBalanceTime > BALANCE_INTERVAL) {
     balanceMotors(leftDist, rightDist, frontDist);
     lastBalanceTime = millis();
   }
 
-  int balancedRightSpeed = rightSpeed * motorBalance;
+  int balancedRightSpeed = targetRightSpeed * motorBalance;
   
-  digitalWrite(AIN1, leftSpeed > 0 ? HIGH : LOW);
-  digitalWrite(AIN2, leftSpeed > 0 ? LOW : HIGH);
-  ledcWrite(0, abs(leftSpeed));
-
-  digitalWrite(BIN1, balancedRightSpeed > 0 ? LOW : HIGH);
-  digitalWrite(BIN2, balancedRightSpeed > 0 ? HIGH : LOW);
-  ledcWrite(1, abs(balancedRightSpeed));
+  setMotorsSmoothly(targetLeftSpeed, balancedRightSpeed);
 
   Serial.printf("TOF: L=%3d F=%3d R=%3d | ", leftDist, frontDist, rightDist);
-  Serial.printf("MOTOR: L=%3d R=%3d | ", leftSpeed, balancedRightSpeed);
-  Serial.printf("ENC: L=%5ld R=%5ld | ", leftEncoderCount, rightEncoderCount);
-  Serial.printf("ACC: X=%-5.1fg Y=%-5.1fg Z=%-5.1fg | ", accelX, accelY, accelZ);
-  Serial.printf("GYRO: X=%-5.0f Y=%-5.0f Z=%-5.0f | ", gyroX, gyroY, gyroZ);
-  Serial.printf("HEADING: %-5.1f TURN: %d\n", heading, isTurning);
+  Serial.printf("MOTOR: L=%3d R=%3d | ", currentLeftSpeed, (int)(currentRightSpeed / motorBalance));
+  Serial.printf("HEADING: %-5.1f TARGET: %-5.1f | ", heading, targetHeading);
+  Serial.printf("STATE: ");
+  
+  switch(currentState) {
+    case FOLLOWING: Serial.print("FOLLOWING"); break;
+    case TURNING: Serial.print("TURNING"); break;
+    case TURNING_90: Serial.print("TURNING_90"); break;
+    case REVERSING: Serial.print("REVERSING"); break;
+    case RECOVERING: Serial.print("RECOVERING"); break;
+    case STOPPED: Serial.print("STOPPED"); break;
+  }
+  Serial.println();
 
   delay(50);
+}
+
+void handleFollowingState(int &leftSpeed, int &rightSpeed, int leftDist, int rightDist, int frontDist, float dt) {
+  // Slow down when approaching an obstacle
+  if (frontDist < frontSlowDistance && frontDist > frontStopDistance) {
+    float slowdownFactor = map(frontDist, frontStopDistance, frontSlowDistance, 0.5, 1.0);
+    leftSpeed *= slowdownFactor;
+    rightSpeed *= slowdownFactor;
+    Serial.printf("Slowing down: F=%d factor=%.1f | ", frontDist, slowdownFactor);
+  }
+
+  // Check for front obstacle and handle corner detection
+  if (frontDist < frontStopDistance) {
+    Serial.printf("Front wall detected: F=%d | ", frontDist);
+    handleCorner(leftSpeed, rightSpeed, leftDist, rightDist, frontDist);
+    return;
+  }
+
+  // Normal wall following
+  bool leftDetected = leftDist < desiredDistance * 2;
+  bool rightDetected = rightDist < desiredDistance * 2;
+  
+  // CONTINUOUSLY update target heading during wall following to prevent drift
+  static unsigned long lastHeadingUpdate = 0;
+  if (millis() - lastHeadingUpdate > 500) { // Update target heading every 500ms
+    targetHeading = heading;
+    lastHeadingUpdate = millis();
+  }
+  
+  if (leftDetected && rightDetected) {
+    if (followingLeft && rightDist < leftDist - HYSTERESIS_THRESHOLD) {
+      followingLeft = false;
+      targetHeading = heading; // Reset target when switching walls
+    } else if (!followingLeft && leftDist < rightDist - HYSTERESIS_THRESHOLD) {
+      followingLeft = true;
+      targetHeading = heading; // Reset target when switching walls
+    }
+  } else if (leftDetected) {
+    if (!followingLeft) {
+      followingLeft = true;
+      targetHeading = heading;
+    }
+  } else if (rightDetected) {
+    if (followingLeft) {
+      followingLeft = false;
+      targetHeading = heading;
+    }
+  } else {
+    followingLeft = false;
+    currentState = RECOVERING;
+    targetHeading = heading;
+  }
+
+  if (leftDetected || rightDetected) {
+    float error = (followingLeft ? leftDist : rightDist) - desiredDistance;
+    
+    if (abs(error) < DEADBAND) {
+      error = 0.0;
+      integral = 0.0;
+    }
+    
+    integral += error * dt;
+    integral = constrain(integral, -30.0, 30.0);
+    float derivative = (error - previousError) / dt;
+    float correction = Kp * error + Ki * integral + Kd * derivative;
+    correction = constrain(correction, -8.0, 8.0);
+    previousError = error;
+
+    if (followingLeft) {
+      rightSpeed += (int)correction;
+    } else {
+      leftSpeed += (int)correction;
+    }
+  } else {
+    integral = 0.0;
+    previousError = 0.0;
+  }
+
+  // Apply stronger heading correction during wall following
+  applyHeadingCorrection(leftSpeed, rightSpeed);
+}
+
+void handleCorner(int &leftSpeed, int &rightSpeed, int leftDist, int rightDist, int frontDist) {
+  // Make corner detection more sensitive - lower the threshold
+  bool leftWallClose = leftDist < 400;  // Increased sensitivity
+  bool rightWallClose = rightDist < 400; // Increased sensitivity
+  
+  // Check if front wall is very close
+  bool frontWallVeryClose = frontDist < 250; // Reduced from 300
+  
+  Serial.printf("Corner detection: L=%d R=%d F=%d | ", leftWallClose, rightWallClose, frontWallVeryClose);
+  
+  if ((leftWallClose && rightWallClose) || (frontDist < frontStopDistance)) {
+    // Dead end or front wall - reverse and then turn
+    currentState = REVERSING;
+    leftSpeed = -baseSpeed;
+    rightSpeed = -baseSpeed;
+    Serial.println("Dead end detected - reversing");
+  }
+  else if (frontWallVeryClose) {
+    // Front wall detected - initiate turn
+    if (leftWallClose && !rightWallClose) {
+      // Right turn (left wall is close, right is open)
+      currentState = TURNING_90;
+      isTurning = true;
+      turnStartTime = millis();
+      leftSpeed = baseSpeed;
+      rightSpeed = -baseSpeed;
+      targetHeading = heading - 90.0;
+      if (targetHeading < -180.0) targetHeading += 360.0;
+      Serial.println("Right turn detected");
+    }
+    else if (rightWallClose && !leftWallClose) {
+      // Left turn (right wall is close, left is open)
+      currentState = TURNING_90;
+      isTurning = true;
+      turnStartTime = millis();
+      leftSpeed = -baseSpeed;
+      rightSpeed = baseSpeed;
+      targetHeading = heading + 90.0;
+      if (targetHeading > 180.0) targetHeading -= 360.0;
+      Serial.println("Left turn detected");
+    }
+    else {
+      // No clear side wall - turn based on current following direction
+      currentState = TURNING;
+      isTurning = true;
+      turnStartTime = millis();
+      
+      if (followingLeft) {
+        leftSpeed = baseSpeed;
+        rightSpeed = -baseSpeed;
+        targetHeading = heading + 90.0;
+      } else {
+        leftSpeed = -baseSpeed;
+        rightSpeed = baseSpeed;
+        targetHeading = heading - 90.0;
+      }
+      Serial.println("Front wall - turning based on current direction");
+    }
+  }
+  
+  integral = 0.0;
+  previousError = 0.0;
+}
+
+void handleTurningState(int &leftSpeed, int &rightSpeed) {
+  // Check if turn is complete using multiple criteria
+  if (isTurnComplete()) {
+    isTurning = false;
+    currentState = FOLLOWING;
+    targetHeading = heading;
+    Serial.println("Turn completed");
+    return;
+  }
+  
+  // Timeout safety
+  if (millis() - turnStartTime > MAX_TURN_TIME) {
+    isTurning = false;
+    currentState = RECOVERING;
+    targetHeading = heading;
+    Serial.println("Turn timeout - switching to recovery");
+  }
+}
+
+void handleReversingState(int &leftSpeed, int &rightSpeed) {
+  static unsigned long reverseStartTime = 0;
+  static bool reverseStarted = false;
+  
+  if (!reverseStarted) {
+    reverseStartTime = millis();
+    reverseStarted = true;
+    leftSpeed = -baseSpeed;
+    rightSpeed = -baseSpeed;
+    Serial.println("Starting reverse maneuver");
+  }
+  
+  // Reverse for a short distance/time
+  if (millis() - reverseStartTime > 1000) { // Reverse for 1 second
+    reverseStarted = false;
+    currentState = TURNING;
+    isTurning = true;
+    turnStartTime = millis();
+    
+    // Turn 180 degrees to face away from dead end
+    leftSpeed = baseSpeed;
+    rightSpeed = -baseSpeed;
+    targetHeading = heading + 180.0;
+    if (targetHeading > 180.0) targetHeading -= 360.0;
+    Serial.println("Reverse completed - turning 180 degrees");
+  }
+}
+
+bool isTurnComplete() {
+  // Check heading-based completion
+  float headingError = abs(targetHeading - heading);
+  if (headingError > 180.0) headingError = 360.0 - headingError;
+  
+  if (headingError < TURN_COMPLETE_THRESHOLD) {
+    return true;
+  }
+  
+  // Check if we see a wall in front (indicating we completed the turn)
+  int frontDist = getMedianDistance(sensorFront, frontDistHistory);
+  if (frontDist < WALL_DETECTION_THRESHOLD && frontDist > 50) {
+    return true;
+  }
+  
+  return false;
 }
 
 void readMPU6050() {
@@ -322,7 +529,6 @@ void readMPU6050() {
     gyroY = gy / 131.0;
     gyroZ = gz / 131.0;
   } else {
-    Serial.println("MPU6050 read failed!");
     accelX = accelY = 0.0;
     accelZ = 1.0;
     gyroX = gyroY = gyroZ = 0.0;
@@ -345,11 +551,9 @@ void balanceMotors(int leftDist, int rightDist, int frontDist) {
       
       if (samples >= BALANCE_SAMPLES) {
         float avgRatio = sumRatio / samples;
-        float correctionGain = 2.0; // Increased for stronger correction
+        float correctionGain = 1.5;
         motorBalance *= avgRatio * correctionGain;
-        motorBalance = constrain(motorBalance, 0.5f, 1.5f); // Wider range
-        Serial.print("Motor balance adjusted to: ");
-        Serial.println(motorBalance, 3);
+        motorBalance = constrain(motorBalance, 0.7f, 1.3f);
         samples = 0;
         sumRatio = 0;
       }
@@ -367,17 +571,67 @@ void updateHeading() {
   lastUpdate = currentTime;
   
   heading += gyroZ * dt;
+  
+  // Keep heading in [-180, 180] range
   if (heading > 180.0) heading -= 360.0;
   if (heading < -180.0) heading += 360.0;
 }
 
 void applyHeadingCorrection(int &leftSpeed, int &rightSpeed) {
-  if (!isTurning) {
+  if (currentState == RECOVERING || currentState == STOPPED) {
+    // Full correction in recovery/stopped states
     float headingError = targetHeading - heading;
-    const float Kp_heading = 0.8; // Further reduced
+    
+    if (headingError > 180.0) headingError -= 360.0;
+    if (headingError < -180.0) headingError += 360.0;
+    
+    if (abs(headingError) < HEADING_CORRECTION_DEADBAND) {
+      return;
+    }
+    
+    const float Kp_heading = 0.3; // Increased gain
     float correction = Kp_heading * headingError;
-    correction = constrain(correction, -10.0, 10.0); // Tighter limit
+    correction = constrain(correction, -6.0, 6.0); // Increased limits
+    
     leftSpeed += (int)correction;
     rightSpeed -= (int)correction;
   }
+  else if (currentState == FOLLOWING) {
+    // Stronger heading correction during wall following
+    float headingError = targetHeading - heading;
+    
+    if (headingError > 180.0) headingError -= 360.0;
+    if (headingError < -180.0) headingError += 360.0;
+    
+    if (abs(headingError) > 5.0) {  // Correct if error > 5 degrees
+      const float Kp_heading_wall = 0.15;  // Stronger correction during wall following
+      float correction = Kp_heading_wall * headingError;
+      correction = constrain(correction, -4.0, 4.0);
+      
+      leftSpeed += (int)correction;
+      rightSpeed -= (int)correction;
+    }
+  }
+}
+
+void setMotorsSmoothly(int targetLeft, int targetRight) {
+  if (targetLeft > currentLeftSpeed) {
+    currentLeftSpeed = min(currentLeftSpeed + MAX_SPEED_CHANGE, targetLeft);
+  } else if (targetLeft < currentLeftSpeed) {
+    currentLeftSpeed = max(currentLeftSpeed - MAX_SPEED_CHANGE, targetLeft);
+  }
+  
+  if (targetRight > currentRightSpeed) {
+    currentRightSpeed = min(currentRightSpeed + MAX_SPEED_CHANGE, targetRight);
+  } else if (targetRight < currentRightSpeed) {
+    currentRightSpeed = max(currentRightSpeed - MAX_SPEED_CHANGE, targetRight);
+  }
+  
+  digitalWrite(AIN1, currentLeftSpeed > 0 ? HIGH : LOW);
+  digitalWrite(AIN2, currentLeftSpeed > 0 ? LOW : HIGH);
+  ledcWrite(0, abs(currentLeftSpeed));
+
+  digitalWrite(BIN1, currentRightSpeed > 0 ? LOW : HIGH);
+  digitalWrite(BIN2, currentRightSpeed > 0 ? HIGH : LOW);
+  ledcWrite(1, abs(currentRightSpeed));
 }
