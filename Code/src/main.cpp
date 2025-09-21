@@ -40,6 +40,13 @@ const int DEADBAND = 5;
 const int MAX_SPEED_CHANGE = 3;
 const float HEADING_CORRECTION_GAIN = 0.12;
 
+// Turn parameters
+const int TURN_SPEED = 60;  // Reduced from 100 for better control
+const int TURN_ACCELERATION = 10;
+const float TURN_ANGLE_TOLERANCE = 3.0;  // Tighter tolerance
+const unsigned long TURN_TIMEOUT_MS = 5000;  // Longer timeout (renamed to avoid conflict)
+const int POSITIONING_SPEED = 60;
+
 // PID Variables
 float previousError = 0.0;
 float integral = 0.0;
@@ -68,12 +75,12 @@ bool followingLeft = true;
 
 // Turn variables
 unsigned long turnStartTime = 0;
-const unsigned long TURN_TIMEOUT = 2500;
 float turnStartHeading = 0.0;
+float targetTurnAngle = 0.0;
 
 // Positioning after turn
 unsigned long positioningStartTime = 0;
-const unsigned long POSITIONING_TIMEOUT = 800;
+const unsigned long POSITIONING_TIMEOUT = 1500;
 
 // Motor smoothing
 int currentLeftSpeed = 0;
@@ -110,6 +117,10 @@ float getFilteredDistance(VL53L0X &sensor, float &filteredValue);
 void readMPU6050();
 void updateHeading();
 void sendToClient(String message);
+void applyTurnVelocityProfile(int &leftSpeed, int &rightSpeed, int targetLeft, int targetRight);
+void stopMotors();
+void debugCornerDetection(float leftDist, float rightDist, float frontDist);
+int getOptimalTurnDirection(float currentHeading, float targetHeading);
 
 void setup() {
   Serial.begin(115200);
@@ -197,7 +208,7 @@ void setup() {
   ledcAttachPin(PWMB, 1);
 
   lastTime = millis();
-  Serial.println("System Ready - Smooth Wall Following!");
+  Serial.println("System Ready - Improved Wall Following!");
 }
 
 void sendToClient(String message) {
@@ -205,6 +216,17 @@ void sendToClient(String message) {
   if (client && client.connected()) {
     client.print(message);
   }
+}
+
+void stopMotors() {
+  currentLeftSpeed = 0;
+  currentRightSpeed = 0;
+  digitalWrite(AIN1, LOW);
+  digitalWrite(AIN2, LOW);
+  digitalWrite(BIN1, LOW);
+  digitalWrite(BIN2, LOW);
+  ledcWrite(0, 0);
+  ledcWrite(1, 0);
 }
 
 float getFilteredDistance(VL53L0X &sensor, float &filteredValue) {
@@ -275,6 +297,27 @@ void setMotorsSmooth(int leftTarget, int rightTarget) {
   ledcWrite(1, abs(currentRightSpeed));
 }
 
+void applyTurnVelocityProfile(int &leftSpeed, int &rightSpeed, int targetLeft, int targetRight) {
+  static int currentLeft = 0;
+  static int currentRight = 0;
+  
+  // Gradually approach target speeds
+  if (currentLeft < targetLeft) {
+    currentLeft = min(currentLeft + TURN_ACCELERATION, targetLeft);
+  } else if (currentLeft > targetLeft) {
+    currentLeft = max(currentLeft - TURN_ACCELERATION, targetLeft);
+  }
+  
+  if (currentRight < targetRight) {
+    currentRight = min(currentRight + TURN_ACCELERATION, targetRight);
+  } else if (currentRight > targetRight) {
+    currentRight = max(currentRight - TURN_ACCELERATION, targetRight);
+  }
+  
+  leftSpeed = currentLeft;
+  rightSpeed = currentRight;
+}
+
 void applyHeadingCorrection(int &leftSpeed, int &rightSpeed) {
   if (currentState != FOLLOWING) return;
   
@@ -293,6 +336,13 @@ void applyHeadingCorrection(int &leftSpeed, int &rightSpeed) {
 }
 
 void handleWallFollowing(int &leftSpeed, int &rightSpeed, float leftDist, float rightDist, float frontDist, float dt) {
+  // Emergency stop if too close to front wall
+  if (frontDist < 80) {
+    leftSpeed = 0;
+    rightSpeed = 0;
+    return;
+  }
+  
   if (leftDist < 50) {
     leftSpeed = BASE_SPEED + 25;
     rightSpeed = BASE_SPEED - 25;
@@ -312,6 +362,8 @@ void handleWallFollowing(int &leftSpeed, int &rightSpeed, float leftDist, float 
   
   if (frontDist < FRONT_STOP_DISTANCE) {
     handleCorner(leftDist, rightDist, frontDist);
+    leftSpeed = 0;
+    rightSpeed = 0;
     return;
   }
   
@@ -393,18 +445,23 @@ void followRightWall(int &leftSpeed, int &rightSpeed, float rightDist, float dt)
   previousError = error;
 }
 
-// REPLACE the handleCorner() function:
-// REPLACE the handleCorner() function:
+// REPLACE the handleCorner function with this:
 void handleCorner(float leftDist, float rightDist, float frontDist) {
-  Serial.print("CORNER DETECTED: ");
+  // More conservative corner detection
+  bool leftOpen = leftDist > WALL_THRESHOLD * 2.0;  // Even more sensitive
+  bool rightOpen = rightDist > WALL_THRESHOLD * 2.0; // Even more sensitive
+  bool frontVeryClose = frontDist < FRONT_STOP_DISTANCE * 0.7; // Even more sensitive
   
-  bool leftOpen = leftDist > WALL_THRESHOLD;
-  bool rightOpen = rightDist > WALL_THRESHOLD;
+  // Only trigger if we have a clear corner (one side definitely open)
+  if (!frontVeryClose || (!leftOpen && !rightOpen)) {
+    return; // Not a clear corner
+  }
   
-  Serial.printf("L=%s R=%s | ", leftOpen ? "OPEN" : "WALL", rightOpen ? "OPEN" : "WALL");
+  Serial.print("CLEAR CORNER DETECTED: ");
+  Serial.printf("L=%.1f R=%.1f F=%.1f | ", leftDist, rightDist, frontDist);
   
-  // Calculate target heading with PROPER direction
-  float targetTurnAngle = 0;
+  // Calculate target heading
+  targetTurnAngle = 0;
   
   if (rightOpen && !leftOpen) {
     Serial.println("TURNING RIGHT (-90°)");
@@ -444,9 +501,11 @@ void handleCorner(float leftDist, float rightDist, float frontDist) {
   
   Serial.printf("Start: %.1f° -> Target: %.1f° (Turn: %.1f°)\n", 
                 heading, targetHeading, targetTurnAngle);
+                
+  // Immediately stop the robot
+  stopMotors();
 }
 
-// REPLACE the isTurnComplete() function:
 bool isTurnComplete() {
   float headingError = targetHeading - heading;
   
@@ -454,39 +513,54 @@ bool isTurnComplete() {
   while (headingError > 180.0) headingError -= 360.0;
   while (headingError < -180.0) headingError += 360.0;
   
-  // Calculate the actual angle turned (shortest path)
+  // Calculate the actual angle turned
   float turnedAngle = heading - turnStartHeading;
   while (turnedAngle > 180.0) turnedAngle -= 360.0;
   while (turnedAngle < -180.0) turnedAngle += 360.0;
   
-  // Calculate intended turn angle
-  float intendedTurn = targetHeading - turnStartHeading;
-  while (intendedTurn > 180.0) intendedTurn -= 360.0;
-  while (intendedTurn < -180.0) intendedTurn += 360.0;
-  
   // Debug output
   static unsigned long lastDebug = 0;
   if (millis() - lastDebug > 300) {
-    Serial.printf("TURN: Cur=%.1f Start=%.1f Targ=%.1f Err=%.1f Turned=%.1f Intend=%.1f\n", 
-                 heading, turnStartHeading, targetHeading, headingError, turnedAngle, intendedTurn);
+    Serial.printf("TURN: Cur=%.1f Start=%.1f Targ=%.1f Err=%.1f Turned=%.1f\n", 
+                 heading, turnStartHeading, targetHeading, headingError, turnedAngle);
     lastDebug = millis();
   }
-   Serial.printf("TURN CHECK: Cur=%.1f Targ=%.1f Err=%.1f\n", heading, targetHeading, headingError);
+  
   // Completion conditions
-  bool closeToTarget = fabs(headingError) < 15.0;
-  bool turnedEnough = fabs(turnedAngle) >= fabs(intendedTurn) * 0.85;
-  bool timeout = (millis() - turnStartTime > TURN_TIMEOUT);
+  bool closeToTarget = fabs(headingError) < TURN_ANGLE_TOLERANCE;
+  bool turnedEnough = fabs(turnedAngle) >= fabs(targetTurnAngle) * 0.8;
+  bool timeout = (millis() - turnStartTime > TURN_TIMEOUT_MS);
   
   return (closeToTarget && turnedEnough) || timeout;
 }
-
-// ...existing code...
 
 bool isPositioningComplete() {
   return (millis() - positioningStartTime > POSITIONING_TIMEOUT);
 }
 
-// ...existing code...
+void debugCornerDetection(float leftDist, float rightDist, float frontDist) {
+  static unsigned long lastDebug = 0;
+  if (millis() - lastDebug > 500) {
+    bool leftOpen = leftDist > WALL_THRESHOLD;
+    bool rightOpen = rightDist > WALL_THRESHOLD;
+    bool frontClose = frontDist < FRONT_STOP_DISTANCE;
+    
+    Serial.printf("CORNER DEBUG: L=%d R=%d F=%d | L_Open=%d R_Open=%d F_Close=%d\n", 
+                 (int)leftDist, (int)rightDist, (int)frontDist, 
+                 leftOpen, rightOpen, frontClose);
+    lastDebug = millis();
+  }
+}
+
+int getOptimalTurnDirection(float currentHeading, float targetHeading) {
+  float error = targetHeading - currentHeading;
+  
+  // Normalize to [-180, 180]
+  while (error > 180.0) error -= 360.0;
+  while (error < -180.0) error += 360.0;
+  
+  return (error > 0) ? 1 : -1; // 1 = left, -1 = right
+}
 
 void loop() {
   // Handle TCP client connections
@@ -503,6 +577,9 @@ void loop() {
   float rightDist = getFilteredDistance(sensorRight, filteredRightDist);
   float frontDist = getFilteredDistance(sensorFront, filteredFrontDist);
   
+  // Debug corner detection
+  debugCornerDetection(leftDist, rightDist, frontDist);
+
   // Update IMU
   readMPU6050();
   updateHeading();
@@ -522,90 +599,92 @@ void loop() {
       applyHeadingCorrection(leftSpeed, rightSpeed);
       break;
       
-// REPLACE the TURNING case in the switch statement:
-// REPLACE the TURNING case in your switch statement:
+// REPLACE the TURNING case with this improved version:
+// REPLACE the TURNING case with this simplified version:
 case TURNING: {
   float headingError = targetHeading - heading;
   
-  // Normalize error to [-180, 180] - CRITICAL!
+  // Normalize error to [-180, 180]
   while (headingError > 180.0) headingError -= 360.0;
   while (headingError < -180.0) headingError += 360.0;
   
-  // DEBUG: Print turn information
+  // Debug output
   static unsigned long lastTurnDebug = 0;
   if (millis() - lastTurnDebug > 200) {
-    Serial.printf("TURN: Cur=%.1f° Targ=%.1f° Err=%.1f°\n", heading, targetHeading, headingError);
+    Serial.printf("TURNING: Cur=%.1f° Targ=%.1f° Err=%.1f°\n", heading, targetHeading, headingError);
     lastTurnDebug = millis();
   }
   
-  // Determine turn direction based on error sign
-  float turnRate = 0;
+  // Calculate turn speed based on error (PROPORTIONAL CONTROL)
+  int turnSpeed = constrain(fabs(headingError) * 1.5, 30, TURN_SPEED);
+  
+  // Determine turn direction
+  int targetLeftSpeed, targetRightSpeed;
+  
   if (headingError > 0) {
-    // Positive error: need to turn RIGHT (clockwise)
-    turnRate = -constrain(headingError * 0.8, 20.0, 50.0);
-    Serial.println("Turning RIGHT (clockwise)");
+    // Need to turn LEFT (counter-clockwise)
+    targetLeftSpeed = -turnSpeed;
+    targetRightSpeed = turnSpeed;
   } else {
-    // Negative error: need to turn LEFT (counter-clockwise)
-    turnRate = -constrain(headingError * 0.8, -50.0, -20.0);
-    Serial.println("Turning LEFT (counter-clockwise)");
+    // Need to turn RIGHT (clockwise)  
+    targetLeftSpeed = turnSpeed;
+    targetRightSpeed = -turnSpeed;
   }
   
-  // Apply turning with base speed
-  leftSpeed = BASE_SPEED/2 + turnRate;
-  rightSpeed = BASE_SPEED/2 - turnRate;
+  // Apply the turn speeds
+  digitalWrite(AIN1, targetLeftSpeed > 0 ? HIGH : LOW);
+  digitalWrite(AIN2, targetLeftSpeed > 0 ? LOW : HIGH);
+  ledcWrite(0, abs(targetLeftSpeed));
+
+  digitalWrite(BIN1, targetRightSpeed > 0 ? LOW : HIGH);
+  digitalWrite(BIN2, targetRightSpeed > 0 ? HIGH : LOW);
+  ledcWrite(1, abs(targetRightSpeed));
   
-  // Ensure minimum speed to keep motors moving
-  leftSpeed = constrain(leftSpeed, -MAX_SPEED, MAX_SPEED);
-  rightSpeed = constrain(rightSpeed, -MAX_SPEED, MAX_SPEED);
+  // Update current speeds for monitoring
+  currentLeftSpeed = targetLeftSpeed;
+  currentRightSpeed = targetRightSpeed;
   
-  if (isTurnComplete()) {
+  // Check if turn is complete - use a bit wider tolerance
+  if (fabs(headingError) < 10.0 || millis() - turnStartTime > TURN_TIMEOUT_MS) {
     currentState = POSITIONING;
     positioningStartTime = millis();
-    targetHeading = heading; // Lock current heading
-    Serial.println("TURN COMPLETE, POSITIONING");
-  } else if (millis() - turnStartTime > TURN_TIMEOUT) {
-    currentState = POSITIONING;
-    positioningStartTime = millis();
-    targetHeading = heading;
-    Serial.println("TURN TIMEOUT, FORCING POSITIONING");
+    
+    // Stop motors
+    stopMotors();
+    
+    if (fabs(headingError) < 10.0) {
+      Serial.printf("TURN COMPLETE: %.1f° -> %.1f° (Error: %.1f°)\n", 
+                   turnStartHeading, heading, headingError);
+    } else {
+      Serial.println("TURN TIMEOUT, FORCING POSITIONING");
+    }
   }
   break;
 }
     
-case POSITIONING: {
-  // More aggressive positioning to actually find the wall
-  if (followingLeft) {
-    // Looking for left wall - move right gently, then left more aggressively
-    leftSpeed = 70;
-    rightSpeed = 30;
-  } else {
-    // Looking for right wall - move left gently, then right more aggressively
-    leftSpeed = 30;
-    rightSpeed = 70;
-  }
-  
-  // Check if we found the target wall
-  bool wallFound = false;
-  if (followingLeft) {
-    wallFound = (leftDist < WALL_THRESHOLD) && (leftDist > 30); // Valid wall range
-  } else {
-    wallFound = (rightDist < WALL_THRESHOLD) && (rightDist > 30);
-  }
-  
-  // Also check if we're completely lost (no walls detected)
-  bool noWalls = (leftDist > WALL_THRESHOLD) && (rightDist > WALL_THRESHOLD) && (frontDist > FRONT_STOP_DISTANCE);
-  
-  if (wallFound || noWalls || isPositioningComplete()) {
-    currentState = FOLLOWING;
-    integral = 0;
-    previousError = 0;
-    targetHeading = heading; // Lock current heading
-    if (wallFound) Serial.println("POSITIONING COMPLETE - WALL FOUND");
-    else if (noWalls) Serial.println("POSITIONING COMPLETE - NO WALLS, CONTINUING");
-    else Serial.println("POSITIONING COMPLETE - TIMEOUT");
-  }
-  break;
-}
+    case POSITIONING: {
+      // Move forward to find the wall
+      leftSpeed = POSITIONING_SPEED;
+      rightSpeed = POSITIONING_SPEED;
+      
+      // Check if we found the target wall
+      bool wallFound = false;
+      if (followingLeft) {
+        wallFound = (leftDist < WALL_THRESHOLD) && (leftDist > 30);
+      } else {
+        wallFound = (rightDist < WALL_THRESHOLD) && (rightDist > 30);
+      }
+      
+      if (wallFound || isPositioningComplete()) {
+        currentState = FOLLOWING;
+        integral = 0;
+        previousError = 0;
+        targetHeading = heading;
+        if (wallFound) Serial.println("POSITIONING COMPLETE - WALL FOUND");
+        else Serial.println("POSITIONING COMPLETE - TIMEOUT");
+      }
+      break;
+    }
       
     case STOPPED:
       leftSpeed = 0;
