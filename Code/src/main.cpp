@@ -1,6 +1,7 @@
 #include <Wire.h>
 #include <VL53L0X.h>
 #include <MPU6050.h>
+#include <WiFi.h>
 
 // TOF Sensors
 VL53L0X sensorLeft;
@@ -84,6 +85,12 @@ float filteredRightDist = 0;
 float filteredFrontDist = 0;
 const float FILTER_ALPHA = 0.3;
 
+// WiFi Configuration
+const char* ssid = "ABC";
+const char* password = "zzom5037";
+WiFiServer server(23);
+WiFiClient client;
+
 //accelerometer calibration offsets
 float gyroZeroOffset = 0.0;
 const float GYRO_DRIFT_ALPHA = 0.001;
@@ -102,11 +109,26 @@ void setMotorsSmooth(int leftTarget, int rightTarget);
 float getFilteredDistance(VL53L0X &sensor, float &filteredValue);
 void readMPU6050();
 void updateHeading();
+void sendToClient(String message);
 
 void setup() {
   Serial.begin(115200);
   Wire.begin(15, 4);
   Wire.setClock(50000);
+
+  // WiFi Connection
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nConnected! IP address: ");
+  Serial.println(WiFi.localIP());
+  
+  // Start TCP server
+  server.begin();
+  Serial.println("TCP server started on port 23");
 
   // Initialize MPU6050
   mpu.initialize();
@@ -176,6 +198,13 @@ void setup() {
 
   lastTime = millis();
   Serial.println("System Ready - Smooth Wall Following!");
+}
+
+void sendToClient(String message) {
+  Serial.print(message);
+  if (client && client.connected()) {
+    client.print(message);
+  }
 }
 
 float getFilteredDistance(VL53L0X &sensor, float &filteredValue) {
@@ -364,6 +393,8 @@ void followRightWall(int &leftSpeed, int &rightSpeed, float rightDist, float dt)
   previousError = error;
 }
 
+// REPLACE the handleCorner() function:
+// REPLACE the handleCorner() function:
 void handleCorner(float leftDist, float rightDist, float frontDist) {
   Serial.print("CORNER DETECTED: ");
   
@@ -415,6 +446,7 @@ void handleCorner(float leftDist, float rightDist, float frontDist) {
                 heading, targetHeading, targetTurnAngle);
 }
 
+// REPLACE the isTurnComplete() function:
 bool isTurnComplete() {
   float headingError = targetHeading - heading;
   
@@ -439,7 +471,7 @@ bool isTurnComplete() {
                  heading, turnStartHeading, targetHeading, headingError, turnedAngle, intendedTurn);
     lastDebug = millis();
   }
-  
+   Serial.printf("TURN CHECK: Cur=%.1f Targ=%.1f Err=%.1f\n", heading, targetHeading, headingError);
   // Completion conditions
   bool closeToTarget = fabs(headingError) < 15.0;
   bool turnedEnough = fabs(turnedAngle) >= fabs(intendedTurn) * 0.85;
@@ -448,11 +480,24 @@ bool isTurnComplete() {
   return (closeToTarget && turnedEnough) || timeout;
 }
 
+// ...existing code...
+
 bool isPositioningComplete() {
   return (millis() - positioningStartTime > POSITIONING_TIMEOUT);
 }
 
+// ...existing code...
+
 void loop() {
+  // Handle TCP client connections
+  if (!client || !client.connected()) {
+    client = server.available();
+    if (client) {
+      Serial.println("New client connected");
+      client.println("Robot Controller Connected");
+    }
+  }
+  
   // Read sensors
   float leftDist = getFilteredDistance(sensorLeft, filteredLeftDist);
   float rightDist = getFilteredDistance(sensorRight, filteredRightDist);
@@ -477,86 +522,90 @@ void loop() {
       applyHeadingCorrection(leftSpeed, rightSpeed);
       break;
       
-    case TURNING: {
-      float headingError = targetHeading - heading;
-      
-      // Normalize error to [-180, 180] - CRITICAL!
-      while (headingError > 180.0) headingError -= 360.0;
-      while (headingError < -180.0) headingError += 360.0;
-      
-      // DEBUG: Print turn information
-      static unsigned long lastTurnDebug = 0;
-      if (millis() - lastTurnDebug > 200) {
-        Serial.printf("TURN: Cur=%.1f° Targ=%.1f° Err=%.1f°\n", heading, targetHeading, headingError);
-        lastTurnDebug = millis();
-      }
-      
-      // Determine turn direction based on error sign
-      float turnRate = 0;
-      if (headingError > 0) {
-        // Positive error: need to turn RIGHT (clockwise)
-        turnRate = -constrain(headingError * 0.8, 20.0, 50.0);
-      } else {
-        // Negative error: need to turn LEFT (counter-clockwise)
-        turnRate = -constrain(headingError * 0.8, -50.0, -20.0);
-      }
-      
-      // Apply turning with base speed
-      leftSpeed = BASE_SPEED/2 + turnRate;
-      rightSpeed = BASE_SPEED/2 - turnRate;
-      
-      // Ensure minimum speed to keep motors moving
-      leftSpeed = constrain(leftSpeed, -MAX_SPEED, MAX_SPEED);
-      rightSpeed = constrain(rightSpeed, -MAX_SPEED, MAX_SPEED);
-      
-      if (isTurnComplete()) {
-        currentState = POSITIONING;
-        positioningStartTime = millis();
-        targetHeading = heading; // Lock current heading
-        Serial.println("TURN COMPLETE, POSITIONING");
-      } else if (millis() - turnStartTime > TURN_TIMEOUT) {
-        currentState = POSITIONING;
-        positioningStartTime = millis();
-        targetHeading = heading;
-        Serial.println("TURN TIMEOUT, FORCING POSITIONING");
-      }
-      break;
-    }
+// REPLACE the TURNING case in the switch statement:
+// REPLACE the TURNING case in your switch statement:
+case TURNING: {
+  float headingError = targetHeading - heading;
+  
+  // Normalize error to [-180, 180] - CRITICAL!
+  while (headingError > 180.0) headingError -= 360.0;
+  while (headingError < -180.0) headingError += 360.0;
+  
+  // DEBUG: Print turn information
+  static unsigned long lastTurnDebug = 0;
+  if (millis() - lastTurnDebug > 200) {
+    Serial.printf("TURN: Cur=%.1f° Targ=%.1f° Err=%.1f°\n", heading, targetHeading, headingError);
+    lastTurnDebug = millis();
+  }
+  
+  // Determine turn direction based on error sign
+  float turnRate = 0;
+  if (headingError > 0) {
+    // Positive error: need to turn RIGHT (clockwise)
+    turnRate = -constrain(headingError * 0.8, 20.0, 50.0);
+    Serial.println("Turning RIGHT (clockwise)");
+  } else {
+    // Negative error: need to turn LEFT (counter-clockwise)
+    turnRate = -constrain(headingError * 0.8, -50.0, -20.0);
+    Serial.println("Turning LEFT (counter-clockwise)");
+  }
+  
+  // Apply turning with base speed
+  leftSpeed = BASE_SPEED/2 + turnRate;
+  rightSpeed = BASE_SPEED/2 - turnRate;
+  
+  // Ensure minimum speed to keep motors moving
+  leftSpeed = constrain(leftSpeed, -MAX_SPEED, MAX_SPEED);
+  rightSpeed = constrain(rightSpeed, -MAX_SPEED, MAX_SPEED);
+  
+  if (isTurnComplete()) {
+    currentState = POSITIONING;
+    positioningStartTime = millis();
+    targetHeading = heading; // Lock current heading
+    Serial.println("TURN COMPLETE, POSITIONING");
+  } else if (millis() - turnStartTime > TURN_TIMEOUT) {
+    currentState = POSITIONING;
+    positioningStartTime = millis();
+    targetHeading = heading;
+    Serial.println("TURN TIMEOUT, FORCING POSITIONING");
+  }
+  break;
+}
     
-    case POSITIONING: {
-      // More aggressive positioning to actually find the wall
-      if (followingLeft) {
-        // Looking for left wall - move right gently, then left more aggressively
-        leftSpeed = 70;
-        rightSpeed = 30;
-      } else {
-        // Looking for right wall - move left gently, then right more aggressively
-        leftSpeed = 30;
-        rightSpeed = 70;
-      }
-      
-      // Check if we found the target wall
-      bool wallFound = false;
-      if (followingLeft) {
-        wallFound = (leftDist < WALL_THRESHOLD) && (leftDist > 30); // Valid wall range
-      } else {
-        wallFound = (rightDist < WALL_THRESHOLD) && (rightDist > 30);
-      }
-      
-      // Also check if we're completely lost (no walls detected)
-      bool noWalls = (leftDist > WALL_THRESHOLD) && (rightDist > WALL_THRESHOLD) && (frontDist > FRONT_STOP_DISTANCE);
-      
-      if (wallFound || noWalls || isPositioningComplete()) {
-        currentState = FOLLOWING;
-        integral = 0;
-        previousError = 0;
-        targetHeading = heading; // Lock current heading
-        if (wallFound) Serial.println("POSITIONING COMPLETE - WALL FOUND");
-        else if (noWalls) Serial.println("POSITIONING COMPLETE - NO WALLS, CONTINUING");
-        else Serial.println("POSITIONING COMPLETE - TIMEOUT");
-      }
-      break;
-    }
+case POSITIONING: {
+  // More aggressive positioning to actually find the wall
+  if (followingLeft) {
+    // Looking for left wall - move right gently, then left more aggressively
+    leftSpeed = 70;
+    rightSpeed = 30;
+  } else {
+    // Looking for right wall - move left gently, then right more aggressively
+    leftSpeed = 30;
+    rightSpeed = 70;
+  }
+  
+  // Check if we found the target wall
+  bool wallFound = false;
+  if (followingLeft) {
+    wallFound = (leftDist < WALL_THRESHOLD) && (leftDist > 30); // Valid wall range
+  } else {
+    wallFound = (rightDist < WALL_THRESHOLD) && (rightDist > 30);
+  }
+  
+  // Also check if we're completely lost (no walls detected)
+  bool noWalls = (leftDist > WALL_THRESHOLD) && (rightDist > WALL_THRESHOLD) && (frontDist > FRONT_STOP_DISTANCE);
+  
+  if (wallFound || noWalls || isPositioningComplete()) {
+    currentState = FOLLOWING;
+    integral = 0;
+    previousError = 0;
+    targetHeading = heading; // Lock current heading
+    if (wallFound) Serial.println("POSITIONING COMPLETE - WALL FOUND");
+    else if (noWalls) Serial.println("POSITIONING COMPLETE - NO WALLS, CONTINUING");
+    else Serial.println("POSITIONING COMPLETE - TIMEOUT");
+  }
+  break;
+}
       
     case STOPPED:
       leftSpeed = 0;
@@ -568,21 +617,22 @@ void loop() {
   
   static unsigned long lastDebugTime = 0;
   if (millis() - lastDebugTime > 100) {
-    Serial.print("L=" + String(leftDist) + " F=" + String(frontDist) + " R=" + String(rightDist) + " | ");
-    Serial.print("MOTOR: L=" + String(currentLeftSpeed) + " R=" + String(currentRightSpeed) + " | ");
-    Serial.print("HEAD: " + String(heading, 1) + " TARG: " + String(targetHeading, 1) + " | ");
-    Serial.print("STATE: ");
+    String message = "L=" + String(leftDist) + " F=" + String(frontDist) + " R=" + String(rightDist) + " | ";
+    message += "MOTOR: L=" + String(currentLeftSpeed) + " R=" + String(currentRightSpeed) + " | ";
+    message += "HEAD: " + String(heading, 1) + " TARG: " + String(targetHeading, 1) + " | ";
+    message += "STATE: ";
     
     switch(currentState) {
-      case FOLLOWING: Serial.print("FOLLOW"); break;
-      case TURNING: Serial.print("TURN"); break;
-      case POSITIONING: Serial.print("POSITION"); break;
-      case STOPPED: Serial.print("STOP"); break;
+      case FOLLOWING: message += "FOLLOW"; break;
+      case TURNING: message += "TURN"; break;
+      case POSITIONING: message += "POSITION"; break;
+      case STOPPED: message += "STOP"; break;
     }
     
-    Serial.print(" | SIDE: " + String(followingLeft ? "LEFT" : "RIGHT"));
-    Serial.println();
+    message += " | SIDE: " + String(followingLeft ? "LEFT" : "RIGHT");
+    message += "\n";
     
+    sendToClient(message);
     lastDebugTime = millis();
   }
   
