@@ -141,6 +141,14 @@ public:
             followRightWall(leftSpeed, rightSpeed, rightDist, dt);
         }
     }
+
+  void resetTurnProfile() {
+        turnStartTime = 0;
+        turnStartHeading = 0.0;
+        targetTurnAngle = 0.0;
+        positioningStartTime = 0;
+    }
+
     
     void handleCorner(float leftDist, float rightDist, float frontDist, IMUHandler &imu) {
         // More conservative corner detection

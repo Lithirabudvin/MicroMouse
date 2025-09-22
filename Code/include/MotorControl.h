@@ -8,6 +8,8 @@ class MotorControl {
 private:
     int currentLeftSpeed = 0;
     int currentRightSpeed = 0;
+    int turnCurrentLeft = 0;  // Separate tracking for turns
+    int turnCurrentRight = 0;
 
 public:
     void setup() {
@@ -19,6 +21,10 @@ public:
         ledcSetup(1, 3000, 8);
         ledcAttachPin(PWMA, 0);
         ledcAttachPin(PWMB, 1);
+        
+        // Initialize turn velocities
+        turnCurrentLeft = 0;
+        turnCurrentRight = 0;
     }
     
     void setMotorsSmooth(int leftTarget, int rightTarget) {
@@ -46,6 +52,8 @@ public:
     void stopMotors() {
         currentLeftSpeed = 0;
         currentRightSpeed = 0;
+        turnCurrentLeft = 0;
+        turnCurrentRight = 0;
         digitalWrite(AIN1, LOW);
         digitalWrite(AIN2, LOW);
         digitalWrite(BIN1, LOW);
@@ -55,23 +63,21 @@ public:
     }
     
     void applyTurnVelocityProfile(int &leftSpeed, int &rightSpeed, int targetLeft, int targetRight) {
-        static int currentLeft = 0;
-        static int currentRight = 0;
-        
-        if (currentLeft < targetLeft) {
-            currentLeft = min(currentLeft + TURN_ACCELERATION, targetLeft);
-        } else if (currentLeft > targetLeft) {
-            currentLeft = max(currentLeft - TURN_ACCELERATION, targetLeft);
+        // Apply acceleration/deceleration to turn speeds
+        if (turnCurrentLeft < targetLeft) {
+            turnCurrentLeft = min(turnCurrentLeft + TURN_ACCELERATION, targetLeft);
+        } else if (turnCurrentLeft > targetLeft) {
+            turnCurrentLeft = max(turnCurrentLeft - TURN_ACCELERATION, targetLeft);
         }
         
-        if (currentRight < targetRight) {
-            currentRight = min(currentRight + TURN_ACCELERATION, targetRight);
-        } else if (currentRight > targetRight) {
-            currentRight = max(currentRight - TURN_ACCELERATION, targetRight);
+        if (turnCurrentRight < targetRight) {
+            turnCurrentRight = min(turnCurrentRight + TURN_ACCELERATION, targetRight);
+        } else if (turnCurrentRight > targetRight) {
+            turnCurrentRight = max(turnCurrentRight - TURN_ACCELERATION, targetRight);
         }
         
-        leftSpeed = currentLeft;
-        rightSpeed = currentRight;
+        leftSpeed = turnCurrentLeft;
+        rightSpeed = turnCurrentRight;
     }
     
     void setTurnMotors(int leftSpeed, int rightSpeed) {
@@ -85,6 +91,11 @@ public:
         
         currentLeftSpeed = leftSpeed;
         currentRightSpeed = rightSpeed;
+    }
+    
+    void resetTurnProfile() {
+        turnCurrentLeft = 0;
+        turnCurrentRight = 0;
     }
     
     int getCurrentLeftSpeed() { return currentLeftSpeed; }

@@ -71,6 +71,9 @@ void loop() {
     int leftSpeed = WallFollower::getBaseSpeed();
     int rightSpeed = WallFollower::getBaseSpeed();
     
+    // Store previous state to detect transitions
+    static RobotState previousState = STOPPED;
+    
     switch (wallFollower.currentState) {
         case FOLLOWING:
             wallFollower.handleWallFollowing(leftSpeed, rightSpeed, leftDist, rightDist, frontDist, dt, imu);
@@ -78,6 +81,13 @@ void loop() {
             break;
             
         case TURNING: {
+            // Reset turn profile when first entering TURNING state
+            if (previousState != TURNING) {
+                wallFollower.resetTurnProfile();
+                motors.resetTurnProfile();
+                Serial.println("TURNING: Reset velocity profile");
+            }
+            
             float headingError = imu.getHeadingError(imu.targetHeading);
             
             #if DEBUG_TURN_PROGRESS
@@ -104,8 +114,22 @@ void loop() {
                 targetRightSpeed = -turnSpeed;
             }
             
-            // Apply turn motors directly
-            motors.setTurnMotors(targetLeftSpeed, targetRightSpeed);
+            // APPLY VELOCITY PROFILING FOR SMOOTH TURN ACCELERATION
+            int profiledLeftSpeed, profiledRightSpeed;
+            motors.applyTurnVelocityProfile(profiledLeftSpeed, profiledRightSpeed, targetLeftSpeed, targetRightSpeed);
+            
+            // Apply profiled turn motors
+            motors.setTurnMotors(profiledLeftSpeed, profiledRightSpeed);
+            
+            // Debug turn velocity profiling
+            #if DEBUG_TURN_PROGRESS
+            static unsigned long lastVelDebug = 0;
+            if (millis() - lastVelDebug > 100) {
+                Serial.printf("TURN VEL: Target(L=%d,R=%d) Profiled(L=%d,R=%d)\n", 
+                             targetLeftSpeed, targetRightSpeed, profiledLeftSpeed, profiledRightSpeed);
+                lastVelDebug = millis();
+            }
+            #endif
             
             // Check if turn is complete
             if (fabs(headingError) < TURN_TOLERANCE_WIDE || millis() - wallFollower.getTurnStartTime() > WallFollower::getTurnTimeout()) {
@@ -159,6 +183,9 @@ void loop() {
     if (wallFollower.currentState != TURNING) {
         motors.setMotorsSmooth(leftSpeed, rightSpeed);
     }
+    
+    // Update previous state for next iteration
+    previousState = wallFollower.currentState;
     
     // Debug output
     #if DEBUG_SENSOR_READINGS
